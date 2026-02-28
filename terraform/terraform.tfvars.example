@@ -1,0 +1,28 @@
+# ──────────────────────────────────────────────
+# Copy this file to terraform.tfvars and fill in real values
+# DO NOT commit terraform.tfvars to git
+# ──────────────────────────────────────────────
+
+aws_region      = "ap-south-1"
+environment     = "prod"
+project_name    = "rds-to-s3-migration"
+s3_bucket_name  = "marsquant-market-data-archive"
+
+schedule_expression = "cron(0 0 1 * ? *)"
+schedule_timezone   = "Asia/Kolkata"
+schedule_enabled    = false
+
+rds_endpoint   = "your-instance.xxxxxxxxxxxx.ap-south-1.rds.amazonaws.com"
+rds_port       = 5432
+rds_database   = "your_database_name"
+rds_username   = "your_username"
+db_secret_arn  = "arn:aws:secretsmanager:ap-south-1:123456789012:secret:your-secret-name"
+
+vpc_id                = "vpc-xxxxxxxxxxxxxxxxx"
+private_subnet_ids    = ["subnet-xxxxxxxxxxxxxxxxx", "subnet-xxxxxxxxxxxxxxxxx"]
+rds_security_group_id = "sg-xxxxxxxxxxxxxxxxx"
+
+alert_email        = "your-email@company.com"
+psycopg2_layer_arn = "arn:aws:lambda:ap-south-1:123456789012:layer:psycopg2:1"
+
+# Pipeline: "lambda_chain" (simpler) or "step_functions" (safer)
