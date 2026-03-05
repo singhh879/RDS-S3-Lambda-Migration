@@ -1,67 +1,65 @@
 # ──────────────────────────────────────────────
-# Lambda Functions — Verification & Partition Drop
+# Lambda Functions + SNS + S3 Event Chain
 # ──────────────────────────────────────────────
-# Two small Python functions:
-#   1. verify_backup — checks S3 file + row count
-#   2. drop_partition — drops RDS partition after verification
+# Three Lambdas:
+#   1. Orchestrator — starts ECS Fargate task
+#   2. Verify — checks backup integrity (triggered by S3 event)
+#   3. Drop Partition — drops RDS partition (triggered by S3 event)
 #
-# Both use psycopg2 to connect to RDS. Since psycopg2
-# needs compiled C libraries, we use an AWS-provided Lambda
-# layer that includes it.
-#
-# COST: Essentially free. Each invocation takes <30 seconds.
+# Chain: Orchestrator → ECS → manifest.json → Verify → verified.json → Drop
 # ──────────────────────────────────────────────
 
 
-# ─── Lambda Layer for psycopg2 ───
-# psycopg2 needs compiled binaries that aren't in the Lambda runtime.
-# We use the aws-psycopg2 layer which provides it.
-# You can also build your own layer, but this is faster.
+# ─── SNS Topic for Alerts ───
 
-# ─── Package the Lambda code into zip files ───
+resource "aws_sns_topic" "migration_alerts" {
+  name = "${var.project_name}-alerts"
+}
 
-data "archive_file" "verify_lambda_zip" {
+resource "aws_sns_topic_subscription" "email_alert" {
+  topic_arn = aws_sns_topic.migration_alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+
+# ─── Package Lambda Code ───
+
+data "archive_file" "orchestrator_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/../lambda/orchestrator"
+  output_path = "${path.module}/../lambda/orchestrator.zip"
+}
+
+data "archive_file" "verify_zip" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/verify"
   output_path = "${path.module}/../lambda/verify.zip"
 }
 
-data "archive_file" "drop_lambda_zip" {
+data "archive_file" "drop_zip" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/drop_partition"
   output_path = "${path.module}/../lambda/drop_partition.zip"
 }
 
 
-# ─── IAM Role for Lambda Functions ───
-# Both Lambdas share a role. They need:
-#   - CloudWatch Logs (for logging)
-#   - S3 read (verification reads the manifest + checks file)
-#   - RDS network access (via VPC)
-#   - Secrets Manager (for DB password)
+# ─── Shared IAM Role ───
 
 resource "aws_iam_role" "lambda_role" {
   name = "${var.project_name}-lambda-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-        Action = "sts:AssumeRole"
-      }
-    ]
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
   })
-
-  tags = {
-    Name = "${var.project_name}-lambda-role"
-  }
 }
 
-# Basic Lambda execution + VPC access
+# Basic execution + VPC access
 resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
@@ -72,33 +70,62 @@ resource "aws_iam_role_policy_attachment" "lambda_vpc" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
-# S3 read access (for verification Lambda)
-resource "aws_iam_role_policy" "lambda_s3_read" {
-  name = "s3-read-backups"
+# S3 read/write (verify reads manifest, writes verified.json; drop reads verified.json)
+resource "aws_iam_role_policy" "lambda_s3" {
+  name = "s3-access"
   role = aws_iam_role.lambda_role.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:HeadObject",
-          "s3:ListBucket"
-        ]
-        Resource = [
-          aws_s3_bucket.data_archive.arn,
-          "${aws_s3_bucket.data_archive.arn}/*"
-        ]
-      }
-    ]
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:HeadObject",
+        "s3:ListBucket"
+      ]
+      Resource = [
+        aws_s3_bucket.data_archive.arn,
+        "${aws_s3_bucket.data_archive.arn}/*"
+      ]
+    }]
   })
 }
 
-# Secrets Manager access (for DB password)
+# Secrets Manager (DB password)
 resource "aws_iam_role_policy" "lambda_secrets" {
   name = "read-db-secret"
+  role = aws_iam_role.lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = var.db_secret_arn
+    }]
+  })
+}
+
+# SNS publish (all Lambdas send notifications)
+resource "aws_iam_role_policy" "lambda_sns" {
+  name = "sns-publish"
+  role = aws_iam_role.lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sns:Publish"
+      Resource = aws_sns_topic.migration_alerts.arn
+    }]
+  })
+}
+
+# ECS access (orchestrator starts tasks)
+resource "aws_iam_role_policy" "lambda_ecs" {
+  name = "ecs-access"
   role = aws_iam_role.lambda_role.id
 
   policy = jsonencode({
@@ -106,20 +133,30 @@ resource "aws_iam_role_policy" "lambda_secrets" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = "secretsmanager:GetSecretValue"
-        Resource = var.db_secret_arn
+        Action   = ["ecs:RunTask", "ecs:DescribeTasks"]
+        Resource = "*"
+        Condition = {
+          ArnEquals = { "ecs:cluster" = aws_ecs_cluster.migration.arn }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = [
+          aws_iam_role.ecs_task_execution_role.arn,
+          aws_iam_role.ecs_task_role.arn
+        ]
       }
     ]
   })
 }
 
 
-# ─── Security Group for Lambdas ───
-# Lambdas run in VPC to reach RDS. They need a security group.
+# ─── Lambda Security Group ───
 
 resource "aws_security_group" "lambda" {
   name        = "${var.project_name}-lambda"
-  description = "Security group for verification and drop partition Lambdas"
+  description = "Security group for all Lambda functions"
   vpc_id      = var.vpc_id
 
   egress {
@@ -127,15 +164,9 @@ resource "aws_security_group" "lambda" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound (RDS, S3, Secrets Manager)"
-  }
-
-  tags = {
-    Name = "${var.project_name}-lambda"
   }
 }
 
-# Allow Lambda to connect to RDS
 resource "aws_security_group_rule" "lambda_to_rds" {
   type                     = "ingress"
   from_port                = var.rds_port
@@ -147,20 +178,69 @@ resource "aws_security_group_rule" "lambda_to_rds" {
 }
 
 
-# ─── Verification Lambda ───
+# ─── CloudWatch Log Groups ───
+
+resource "aws_cloudwatch_log_group" "orchestrator_logs" {
+  name              = "/aws/lambda/${var.project_name}-orchestrator"
+  retention_in_days = 30
+}
+
+resource "aws_cloudwatch_log_group" "verify_logs" {
+  name              = "/aws/lambda/${var.project_name}-verify-backup"
+  retention_in_days = 30
+}
+
+resource "aws_cloudwatch_log_group" "drop_logs" {
+  name              = "/aws/lambda/${var.project_name}-drop-partition"
+  retention_in_days = 30
+}
+
+
+# ═══════════════════════════════════════════
+# Lambda 1: Orchestrator
+# ═══════════════════════════════════════════
+
+resource "aws_lambda_function" "orchestrator" {
+  function_name    = "${var.project_name}-orchestrator"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "handler.lambda_handler"
+  runtime          = "python3.12"
+  timeout          = 60
+  memory_size      = 256
+
+  filename         = data.archive_file.orchestrator_zip.output_path
+  source_code_hash = data.archive_file.orchestrator_zip.output_base64sha256
+
+  environment {
+    variables = {
+      ECS_CLUSTER     = aws_ecs_cluster.migration.arn
+      TASK_DEFINITION = aws_ecs_task_definition.export_task.arn
+      SUBNETS         = jsonencode(var.private_subnet_ids)
+      SECURITY_GROUPS = jsonencode([aws_security_group.fargate_export.id])
+      SNS_TOPIC_ARN   = aws_sns_topic.migration_alerts.arn
+      CONTAINER_NAME  = "export"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.orchestrator_logs]
+}
+
+
+# ═══════════════════════════════════════════
+# Lambda 2: Verification
+# ═══════════════════════════════════════════
 
 resource "aws_lambda_function" "verify_backup" {
   function_name    = "${var.project_name}-verify-backup"
   role             = aws_iam_role.lambda_role.arn
   handler          = "handler.lambda_handler"
   runtime          = "python3.12"
-  timeout          = 120        # 2 minutes — enough for S3 check + RDS query
+  timeout          = 120
   memory_size      = 256
 
-  filename         = data.archive_file.verify_lambda_zip.output_path
-  source_code_hash = data.archive_file.verify_lambda_zip.output_base64sha256
+  filename         = data.archive_file.verify_zip.output_path
+  source_code_hash = data.archive_file.verify_zip.output_base64sha256
 
-  # Run in VPC so it can reach RDS
   vpc_config {
     subnet_ids         = var.private_subnet_ids
     security_group_ids = [aws_security_group.lambda.id]
@@ -172,32 +252,31 @@ resource "aws_lambda_function" "verify_backup" {
       DB_PORT       = tostring(var.rds_port)
       DB_NAME       = var.rds_database
       DB_USER       = var.rds_username
-      DB_PASSWORD   = "PLACEHOLDER"
+      DB_PASSWORD   = "PLACEHOLDER"  # TODO: read from Secrets Manager in code
       SNS_TOPIC_ARN = aws_sns_topic.migration_alerts.arn
     }
   }
 
-  # psycopg2 layer — provides the compiled PostgreSQL client library
   layers = [var.psycopg2_layer_arn]
 
-  tags = {
-    Name = "${var.project_name}-verify-backup"
-  }
+  depends_on = [aws_cloudwatch_log_group.verify_logs]
 }
 
 
-# ─── Drop Partition Lambda ───
+# ═══════════════════════════════════════════
+# Lambda 3: Drop Partition
+# ═══════════════════════════════════════════
 
 resource "aws_lambda_function" "drop_partition" {
   function_name    = "${var.project_name}-drop-partition"
   role             = aws_iam_role.lambda_role.arn
   handler          = "handler.lambda_handler"
   runtime          = "python3.12"
-  timeout          = 300        # 5 minutes — VACUUM can take a while
+  timeout          = 300
   memory_size      = 256
 
-  filename         = data.archive_file.drop_lambda_zip.output_path
-  source_code_hash = data.archive_file.drop_lambda_zip.output_base64sha256
+  filename         = data.archive_file.drop_zip.output_path
+  source_code_hash = data.archive_file.drop_zip.output_base64sha256
 
   vpc_config {
     subnet_ids         = var.private_subnet_ids
@@ -210,7 +289,7 @@ resource "aws_lambda_function" "drop_partition" {
       DB_PORT       = tostring(var.rds_port)
       DB_NAME       = var.rds_database
       DB_USER       = var.rds_username
-      DB_PASSWORD   = "PLACEHOLDER"
+      DB_PASSWORD   = "PLACEHOLDER"  # TODO: read from Secrets Manager in code
       S3_BUCKET     = var.s3_bucket_name
       SNS_TOPIC_ARN = aws_sns_topic.migration_alerts.arn
     }
@@ -218,7 +297,53 @@ resource "aws_lambda_function" "drop_partition" {
 
   layers = [var.psycopg2_layer_arn]
 
-  tags = {
-    Name = "${var.project_name}-drop-partition"
+  depends_on = [aws_cloudwatch_log_group.drop_logs]
+}
+
+
+# ═══════════════════════════════════════════
+# S3 Event Chain — The Wiring
+# ═══════════════════════════════════════════
+# manifest.json upload → triggers Verify Lambda
+# verified.json upload → triggers Drop Partition Lambda
+
+resource "aws_lambda_permission" "s3_invoke_verify" {
+  statement_id   = "AllowS3InvokeVerify"
+  action         = "lambda:InvokeFunction"
+  function_name  = aws_lambda_function.verify_backup.function_name
+  principal      = "s3.amazonaws.com"
+  source_arn     = aws_s3_bucket.data_archive.arn
+  source_account = data.aws_caller_identity.current.account_id
+}
+
+resource "aws_lambda_permission" "s3_invoke_drop" {
+  statement_id   = "AllowS3InvokeDrop"
+  action         = "lambda:InvokeFunction"
+  function_name  = aws_lambda_function.drop_partition.function_name
+  principal      = "s3.amazonaws.com"
+  source_arn     = aws_s3_bucket.data_archive.arn
+  source_account = data.aws_caller_identity.current.account_id
+}
+
+resource "aws_s3_bucket_notification" "chain_triggers" {
+  bucket = aws_s3_bucket.data_archive.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.verify_backup.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "metadata/"
+    filter_suffix       = "manifest.json"
   }
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.drop_partition.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "metadata/"
+    filter_suffix       = "verified.json"
+  }
+
+  depends_on = [
+    aws_lambda_permission.s3_invoke_verify,
+    aws_lambda_permission.s3_invoke_drop
+  ]
 }

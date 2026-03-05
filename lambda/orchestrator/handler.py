@@ -1,42 +1,11 @@
 """
-Orchestrator Lambda (Lambda-Chain Version)
-──────────────────────────────────────────
-This Lambda replaces Step Functions in the simpler pipeline.
-
-WHAT IT DOES:
-  1. Receives year/month from EventBridge (or manual invocation)
-  2. Starts the ECS Fargate task with the correct environment variables
-  3. Does NOT wait for the task — ECS completion triggers verification
-     via S3 event notification on the manifest.json upload
-
-FLOW:
-  EventBridge (or manual)
-      │
-      ▼
-  This Lambda (starts ECS task)
-      │
-      ▼
-  ECS Fargate runs pg_dump → uploads dump + manifest.json to S3
-      │
-      ▼
-  S3 PutObject event on metadata/YYYY/MM/manifest.json
-      │
-      ▼
-  Verification Lambda (triggered by S3 event)
-      │
-      ├─ verified=false → SNS FAILURE alert → STOP
-      │
-      ▼ verified=true
-  Drop Partition Lambda (invoked by Verification Lambda directly)
-      │
-      ▼
-  SNS SUCCESS alert → END
-
-MANUAL TRIGGER:
-  aws lambda invoke \
-    --function-name rds-to-s3-migration-orchestrator \
-    --payload '{"year":"2025","month":"02"}' \
-    /tmp/result.json
+Orchestrator Lambda — Starts ECS Fargate pg_dump task
+─────────────────────────────────────────────────────
+Triggered by EventBridge or manual invocation.
+Starts the ECS task and exits. Does NOT wait.
+The chain continues via S3 events:
+  manifest.json upload → Verification Lambda
+  verified.json upload → Drop Partition Lambda
 """
 
 import os
@@ -48,9 +17,9 @@ ecs_client = boto3.client("ecs")
 sns_client = boto3.client("sns")
 
 CLUSTER        = os.environ["ECS_CLUSTER"]
-TASK_DEF       = os.environ["ECS_TASK_DEFINITION"]
+TASK_DEF       = os.environ["TASK_DEFINITION"]
 SUBNETS        = json.loads(os.environ["SUBNETS"])
-SECURITY_GROUP = os.environ["SECURITY_GROUP"]
+SECURITY_GROUPS = json.loads(os.environ["SECURITY_GROUPS"])
 SNS_TOPIC_ARN  = os.environ["SNS_TOPIC_ARN"]
 CONTAINER_NAME = os.environ.get("CONTAINER_NAME", "export")
 
@@ -81,7 +50,7 @@ def lambda_handler(event, context):
             networkConfiguration={
                 "awsvpcConfiguration": {
                     "subnets": SUBNETS,
-                    "securityGroups": [SECURITY_GROUP],
+                    "securityGroups": SECURITY_GROUPS,
                     "assignPublicIp": "DISABLED"
                 }
             },
@@ -101,22 +70,16 @@ def lambda_handler(event, context):
         if response.get("failures"):
             failure_msg = json.dumps(response["failures"], indent=2)
             print(f"ECS task failed to start: {failure_msg}")
-            sns_client.publish(
-                TopicArn=SNS_TOPIC_ARN,
-                Subject=f"MIGRATION ALERT: ECS task failed to START for {year}-{month}",
-                Message=f"Month: {year}-{month}\nFailures:\n{failure_msg}"
-            )
+            _notify(f"ALERT: ECS failed to START for {year}-{month}",
+                    f"Month: {year}-{month}\nFailures:\n{failure_msg}")
             raise Exception(f"ECS task failed to start: {failure_msg}")
 
         task_arn = response["tasks"][0]["taskArn"]
         print(f"ECS task started: {task_arn}")
 
-        sns_client.publish(
-            TopicArn=SNS_TOPIC_ARN,
-            Subject=f"Migration STARTED for {year}-{month}",
-            Message=f"ECS task started.\nMonth: {year}-{month}\nTask: {task_arn}\n\n"
-                    f"Verification will trigger automatically when manifest.json lands in S3."
-        )
+        _notify(f"Migration STARTED: {year}-{month}",
+                f"ECS task started.\nMonth: {year}-{month}\nTask: {task_arn}\n\n"
+                f"Next: verification triggers automatically when manifest.json lands in S3.")
 
         return {"status": "started", "year": year, "month": month, "task_arn": task_arn}
 
@@ -124,9 +87,13 @@ def lambda_handler(event, context):
         error_msg = str(e)
         print(f"ERROR: {error_msg}")
         if "ECS task failed to start" not in error_msg:
-            sns_client.publish(
-                TopicArn=SNS_TOPIC_ARN,
-                Subject=f"MIGRATION ALERT: Orchestrator FAILED for {year}-{month}",
-                Message=f"Month: {year}-{month}\nError: {error_msg}"
-            )
+            _notify(f"ALERT: Orchestrator FAILED for {year}-{month}",
+                    f"Month: {year}-{month}\nError: {error_msg}")
         raise
+
+
+def _notify(subject, message):
+    try:
+        sns_client.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
+    except Exception as e:
+        print(f"WARNING: SNS failed: {e}")

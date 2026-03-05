@@ -1,17 +1,8 @@
-# Terraform
 *.tfstate
 *.tfstate.*
 .terraform/
 .terraform.lock.hcl
 crash.log
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-
-# NEVER commit this — it contains RDS credentials and account-specific values
 terraform.tfvars
-
-# OS files
+lambda/*.zip
 .DS_Store
-Thumbs.db
