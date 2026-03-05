@@ -100,15 +100,14 @@ log "RDS connection successful"
 
 log "Counting rows for ${TARGET_YEAR}-${TARGET_MONTH}..."
 
-ROW_COUNT=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+ROW_COUNT=""
+if ! ROW_COUNT=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
   -t -A -c "
     SELECT COUNT(*)
     FROM market_data
     WHERE trade_date >= '${TARGET_YEAR}-${TARGET_MONTH}-01'
       AND trade_date < '${TARGET_YEAR}-${TARGET_MONTH}-01'::date + INTERVAL '1 month';
-  " 2>&1)
-
-if [ $? -ne 0 ]; then
+  " 2>&1); then
   error "Failed to get row count: $ROW_COUNT"
   error ">>> You likely need to customize the table name and date column in export.sh <<<"
   exit 1
