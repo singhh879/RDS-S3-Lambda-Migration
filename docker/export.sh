@@ -7,12 +7,11 @@
 #
 # WHAT IT DOES:
 #   1. Validates all required environment variables
-#   2. Connects to RDS and runs pg_dump for the target month's partition
+#   2. Connects to RDS and runs pg_dump for the target daily partition
 #   3. Compresses the output with gzip
-#   4. Uploads to S3 at: s3://bucket/backups/YYYY/MM/dump_YYYYMM.sql.gz
+#   4. Uploads to S3 at: s3://bucket/backups/YYYY/MM/DD/dump_YYYYMMDD.sql.gz
 #   5. Writes a metadata manifest (row count, file size, checksum)
 #   6. Exits 0 on success, 1 on failure
-#      (Step Functions uses exit code to decide next step)
 #
 # REQUIRED ENV VARS (set by ECS task definition):
 #   PGHOST       — RDS endpoint
@@ -21,11 +20,13 @@
 #   PGUSER       — database user
 #   PGPASSWORD   — database password (from Secrets Manager)
 #   TARGET_YEAR  — e.g., "2025"
-#   TARGET_MONTH — e.g., "02"
+#   TARGET_MONTH — e.g., "09"
+#   TARGET_DAY   — e.g., "01"
+#   TABLE_NAME   — e.g., "nifty50_table"  (partition parent name)
+#   SCHEMA_NAME  — e.g., "datafeedschema"
 #   S3_BUCKET    — S3 bucket name
 #
 # OPTIONAL:
-#   PARTITION_TABLE_PATTERN — table name pattern (default: see below)
 #   DRY_RUN      — if "true", runs everything except the actual upload
 # ──────────────────────────────────────────────
 
@@ -44,7 +45,7 @@ error() { echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1" >&2; }
 # ─── Step 1: Validate environment variables ───
 log "Starting RDS to S3 export..."
 
-REQUIRED_VARS=("PGHOST" "PGPORT" "PGDATABASE" "PGUSER" "PGPASSWORD" "TARGET_YEAR" "TARGET_MONTH" "S3_BUCKET")
+REQUIRED_VARS=("PGHOST" "PGPORT" "PGDATABASE" "PGUSER" "PGPASSWORD" "TARGET_YEAR" "TARGET_MONTH" "TARGET_DAY" "TABLE_NAME" "SCHEMA_NAME" "S3_BUCKET")
 for var in "${REQUIRED_VARS[@]}"; do
   if [ -z "${!var:-}" ]; then
     error "Required environment variable $var is not set"
@@ -52,24 +53,35 @@ for var in "${REQUIRED_VARS[@]}"; do
   fi
 done
 
-# Validate month format (01-12)
-if ! [[ "$TARGET_MONTH" =~ ^(0[1-9]|1[0-2])$ ]]; then
-  error "TARGET_MONTH must be 01-12, got: $TARGET_MONTH"
-  exit 1
-fi
-
 # Validate year format (4 digits)
 if ! [[ "$TARGET_YEAR" =~ ^[0-9]{4}$ ]]; then
   error "TARGET_YEAR must be 4 digits, got: $TARGET_YEAR"
   exit 1
 fi
 
-DRY_RUN="${DRY_RUN:-false}"
-DUMP_FILE="/tmp/dump_${TARGET_YEAR}${TARGET_MONTH}.sql.gz"
-S3_KEY="backups/${TARGET_YEAR}/${TARGET_MONTH}/dump_${TARGET_YEAR}${TARGET_MONTH}.sql.gz"
-METADATA_KEY="metadata/${TARGET_YEAR}/${TARGET_MONTH}/manifest.json"
+# Validate month format (01-12)
+if ! [[ "$TARGET_MONTH" =~ ^(0[1-9]|1[0-2])$ ]]; then
+  error "TARGET_MONTH must be 01-12, got: $TARGET_MONTH"
+  exit 1
+fi
 
-log "Target: ${TARGET_YEAR}-${TARGET_MONTH}"
+# Validate day format (01-31)
+if ! [[ "$TARGET_DAY" =~ ^(0[1-9]|[12][0-9]|3[01])$ ]]; then
+  error "TARGET_DAY must be 01-31, got: $TARGET_DAY"
+  exit 1
+fi
+
+DRY_RUN="${DRY_RUN:-false}"
+
+# ─── Derived names ───
+PARTITION_NAME="${TABLE_NAME}_${TARGET_YEAR}_${TARGET_MONTH}_${TARGET_DAY}"
+DUMP_FILE="/tmp/dump_${TARGET_YEAR}${TARGET_MONTH}${TARGET_DAY}.sql.gz"
+S3_KEY="backups/${TARGET_YEAR}/${TARGET_MONTH}/${TARGET_DAY}/dump_${TARGET_YEAR}${TARGET_MONTH}${TARGET_DAY}.sql.gz"
+METADATA_KEY="metadata/${TARGET_YEAR}/${TARGET_MONTH}/${TARGET_DAY}/manifest.json"
+
+log "Table:     ${SCHEMA_NAME}.${TABLE_NAME}"
+log "Partition: ${PARTITION_NAME}"
+log "Target:    ${TARGET_YEAR}-${TARGET_MONTH}-${TARGET_DAY}"
 log "S3 destination: s3://${S3_BUCKET}/${S3_KEY}"
 
 # ─── Step 2: Test RDS connectivity ───
@@ -80,62 +92,45 @@ if ! psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c "SELECT 1;"
 fi
 log "RDS connection successful"
 
-# ─── Step 3: Get row count BEFORE dump (for verification later) ───
-# ────────────────────────────────────────────────────────
-# IMPORTANT: You MUST customize this query for your schema.
-# ────────────────────────────────────────────────────────
-# Option A: If your data is in a PARTITIONED table, the partition
-#           name might be something like: market_data_y2025m02
-#           Uncomment and adjust the query below.
-#
-# Option B: If your data is in a single table with a date column,
-#           use a WHERE clause on that column.
-#
-# Option C: If you have separate tables per month, use the table name directly.
-#
-# For now, this uses Option B as a safe default.
-# Replace 'market_data' with your actual table name.
-# Replace 'trade_date' with your actual date column.
-# ────────────────────────────────────────────────────────
+# ─── Step 3: Verify partition exists ───
+log "Checking partition ${PARTITION_NAME} exists..."
+PARTITION_EXISTS=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+  -t -A -c "
+    SELECT EXISTS (
+      SELECT 1 FROM information_schema.tables
+      WHERE table_schema = '${SCHEMA_NAME}'
+        AND table_name   = '${PARTITION_NAME}'
+    );
+  " 2>&1)
 
-log "Counting rows for ${TARGET_YEAR}-${TARGET_MONTH}..."
+if [ "$PARTITION_EXISTS" != "t" ]; then
+  error "Partition ${SCHEMA_NAME}.${PARTITION_NAME} does not exist. Aborting."
+  exit 1
+fi
+log "Partition confirmed"
+
+# ─── Step 4: Get row count BEFORE dump (for manifest + verification) ───
+# Counts directly from the daily partition — fast, no full table scan.
+log "Counting rows in ${PARTITION_NAME}..."
 
 ROW_COUNT=""
 if ! ROW_COUNT=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
-  -t -A -c "
-    SELECT COUNT(*)
-    FROM market_data
-    WHERE trade_date >= '${TARGET_YEAR}-${TARGET_MONTH}-01'
-      AND trade_date < '${TARGET_YEAR}-${TARGET_MONTH}-01'::date + INTERVAL '1 month';
-  " 2>&1); then
+  -t -A -c "SELECT COUNT(*) FROM ${SCHEMA_NAME}.\"${PARTITION_NAME}\";" 2>&1); then
   error "Failed to get row count: $ROW_COUNT"
-  error ">>> You likely need to customize the table name and date column in export.sh <<<"
   exit 1
 fi
 
 log "Row count: ${ROW_COUNT}"
 
 if [ "$ROW_COUNT" -eq 0 ]; then
-  error "Row count is 0 — no data found for ${TARGET_YEAR}-${TARGET_MONTH}. Aborting."
+  error "Row count is 0 — no data found in ${PARTITION_NAME}. Aborting."
   exit 1
 fi
 
-# ─── Step 4: Run pg_dump ───
-# ────────────────────────────────────────────────────────
-# IMPORTANT: Customize pg_dump flags for your schema.
-# ────────────────────────────────────────────────────────
-# Current approach: dump the ENTIRE database with gzip compression.
-# If your database has partitions, you can target a specific partition:
-#   pg_dump -t "market_data_y2025m02" ...
-#
-# If you want to dump only specific tables:
-#   pg_dump -t "table1" -t "table2" ...
-#
-# The --no-owner and --no-privileges flags make the dump portable
-# (it won't fail on restore if users/roles don't exist).
-# ────────────────────────────────────────────────────────
-
-log "Running pg_dump..."
+# ─── Step 5: Run pg_dump ───
+# Targets only the specific daily partition in the correct schema.
+# --no-owner and --no-privileges make the dump portable across environments.
+log "Running pg_dump for ${SCHEMA_NAME}.${PARTITION_NAME}..."
 DUMP_START=$(date +%s)
 
 pg_dump \
@@ -143,6 +138,7 @@ pg_dump \
   -p "$PGPORT" \
   -U "$PGUSER" \
   -d "$PGDATABASE" \
+  -t "${SCHEMA_NAME}.${PARTITION_NAME}" \
   --no-owner \
   --no-privileges \
   --verbose \
@@ -171,7 +167,7 @@ if [ "$FILE_SIZE" -lt 1024 ]; then
   exit 1
 fi
 
-# ─── Step 5: Upload to S3 ───
+# ─── Step 6: Upload to S3 ───
 if [ "$DRY_RUN" = "true" ]; then
   warn "DRY_RUN=true — skipping S3 upload"
 else
@@ -179,7 +175,7 @@ else
   UPLOAD_START=$(date +%s)
 
   aws s3 cp "$DUMP_FILE" "s3://${S3_BUCKET}/${S3_KEY}" \
-    --server-side-encryption AES256 \
+    --sse AES256 \
     --only-show-errors
 
   if [ $? -ne 0 ]; then
@@ -205,14 +201,16 @@ else
   log "S3 upload verified — sizes match"
 fi
 
-# ─── Step 6: Write metadata manifest ───
+# ─── Step 7: Write metadata manifest ───
 # This JSON file is what the verification Lambda reads.
-# It contains everything needed to verify the backup.
-
 MANIFEST=$(cat <<EOF
 {
   "year": "${TARGET_YEAR}",
   "month": "${TARGET_MONTH}",
+  "day": "${TARGET_DAY}",
+  "table_name": "${TABLE_NAME}",
+  "schema_name": "${SCHEMA_NAME}",
+  "partition_name": "${PARTITION_NAME}",
   "s3_bucket": "${S3_BUCKET}",
   "s3_key": "${S3_KEY}",
   "file_size_bytes": ${FILE_SIZE},
@@ -231,21 +229,22 @@ if [ "$DRY_RUN" = "true" ]; then
   echo "$MANIFEST"
 else
   echo "$MANIFEST" | aws s3 cp - "s3://${S3_BUCKET}/${METADATA_KEY}" \
-    --server-side-encryption AES256 \
+    --sse AES256 \
     --content-type "application/json" \
     --only-show-errors
 
   log "Metadata manifest uploaded to s3://${S3_BUCKET}/${METADATA_KEY}"
 fi
 
-# ─── Step 7: Cleanup ───
+# ─── Step 8: Cleanup ───
 rm -f "$DUMP_FILE"
 log "Local dump file cleaned up"
 
 # ─── Done ───
 log "════════════════════════════════════════════"
 log "  EXPORT COMPLETE"
-log "  Month:     ${TARGET_YEAR}-${TARGET_MONTH}"
+log "  Partition: ${PARTITION_NAME}"
+log "  Date:      ${TARGET_YEAR}-${TARGET_MONTH}-${TARGET_DAY}"
 log "  Rows:      ${ROW_COUNT}"
 log "  Size:      ${FILE_SIZE_MB} MB"
 log "  Checksum:  ${CHECKSUM}"

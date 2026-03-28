@@ -49,7 +49,7 @@ resource "aws_iam_role_policy" "eventbridge_invoke_orchestrator" {
 
 resource "aws_scheduler_schedule" "monthly_migration" {
   name        = "${var.project_name}-monthly-trigger"
-  description = "Triggers RDS to S3 migration on 1st of each month at midnight IST"
+  description = "Fires on the 1st of each month — orchestrator launches one ECS task per daily partition in the previous month"
   group_name  = "default"
 
   schedule_expression          = var.schedule_expression

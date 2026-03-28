@@ -1,0 +1,46 @@
+# ──────────────────────────────────────────────
+# Local Testing Infrastructure — MarsQuant RDS-to-S3 Pipeline
+# ──────────────────────────────────────────────
+# Services:
+#   postgres — PostgreSQL 16, mirrors production schema
+#
+# Usage:
+#   docker compose up -d              # start (auto-runs setup_test_db.sql on first boot)
+#   docker compose down -v            # stop + delete volume (full reset)
+#   docker compose logs -f postgres   # tail logs
+#
+# Port 5433 avoids conflict with any local Postgres already on 5432.
+# ──────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: marsquant-test-postgres
+    environment:
+      POSTGRES_DB: datafeeddatabase
+      POSTGRES_USER: marsquantMasterUser
+      POSTGRES_PASSWORD: testpassword
+    ports:
+      - "5433:5432"
+    volumes:
+      - marsquant-pgdata:/var/lib/postgresql/data
+      # Auto-runs on first start (only when data dir is empty)
+      - ./test/setup_test_db.sql:/docker-entrypoint-initdb.d/01_setup_test_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marsquantMasterUser -d datafeeddatabase"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks:
+      - marsquant-test-net
+
+networks:
+  marsquant-test-net:
+    name: marsquant-test-net
+    driver: bridge
+
+volumes:
+  marsquant-pgdata:
+    name: marsquant-pgdata

@@ -225,6 +225,11 @@ resource "aws_ecs_task_definition" "export_task" {
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
   task_role_arn            = aws_iam_role.ecs_task_role.arn
 
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
   # Ephemeral storage for the dump file before upload
   # Default is 20 GB, increase if single month dumps exceed that
   ephemeral_storage {
@@ -243,17 +248,24 @@ resource "aws_ecs_task_definition" "export_task" {
         { name = "PGDATABASE",   value = var.rds_database },
         { name = "PGUSER",       value = var.rds_username },
         { name = "S3_BUCKET",    value = var.s3_bucket_name },
-        # TARGET_YEAR and TARGET_MONTH are overridden by Step Functions
-        # at runtime via containerOverrides. Defaults here for safety.
-        { name = "TARGET_YEAR",  value = "2025" },
-        { name = "TARGET_MONTH", value = "02" },
+        { name = "SCHEMA_NAME",  value = "datafeedschema" },
+        { name = "TABLE_NAME",   value = "nifty50_table" },
+        # TARGET_YEAR, TARGET_MONTH, TARGET_DAY are overridden at runtime
+        # by the Orchestrator Lambda via containerOverrides.
+        # Defaults are intentionally inert — won't match a real partition.
+        { name = "TARGET_YEAR",  value = "1970" },
+        { name = "TARGET_MONTH", value = "01"   },
+        { name = "TARGET_DAY",   value = "01"   },
       ]
 
       # DB password from Secrets Manager — never hardcoded
+      # The RDS-managed secret stores credentials as JSON:
+      # {"username":"...","password":"...","host":"...","port":...}
+      # Appending :password:: tells ECS to extract only the password field.
       secrets = [
         {
           name      = "PGPASSWORD"
-          valueFrom = var.db_secret_arn
+          valueFrom = "${var.db_secret_arn}:password::"
         }
       ]
 

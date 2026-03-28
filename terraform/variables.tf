@@ -23,7 +23,7 @@ variable "project_name" {
 # ─── EventBridge ───
 
 variable "schedule_expression" {
-  description = "Cron expression for the monthly trigger"
+  description = "Cron expression for the monthly trigger (default: 1st of each month at midnight IST)"
   type        = string
   default     = "cron(0 0 1 * ? *)"
 }

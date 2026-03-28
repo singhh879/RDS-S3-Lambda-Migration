@@ -1,0 +1,11 @@
+# Python test dependencies
+# Install: pip install -r test/requirements.txt
+
+# AWS mocking (S3, Secrets Manager, SNS)
+moto[s3,secretsmanager,sns]>=4.2
+
+# AWS SDK (Lambda handlers use boto3)
+boto3>=1.28
+
+# PostgreSQL driver (Lambda handlers use psycopg2)
+psycopg2-binary>=2.9

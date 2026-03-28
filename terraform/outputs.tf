@@ -47,5 +47,11 @@ output "eventbridge_state" {
 }
 
 output "manual_trigger_command" {
-  value = "aws lambda invoke --function-name ${aws_lambda_function.orchestrator.function_name} --payload '{\"year\":\"2025\",\"month\":\"02\"}' --cli-binary-format raw-in-base64-out /tmp/result.json"
+  description = "Trigger a single day (testing)"
+  value       = "aws lambda invoke --function-name ${aws_lambda_function.orchestrator.function_name} --payload '{\"year\":\"2025\",\"month\":\"09\",\"day\":\"01\"}' --cli-binary-format raw-in-base64-out /tmp/result.json"
+}
+
+output "manual_trigger_month_command" {
+  description = "Trigger all days in a month (Sep 2025 test run)"
+  value       = "aws lambda invoke --function-name ${aws_lambda_function.orchestrator.function_name} --payload '{\"action\":\"migrate_month\",\"year\":\"2025\",\"month\":\"09\"}' --cli-binary-format raw-in-base64-out /tmp/result.json"
 }

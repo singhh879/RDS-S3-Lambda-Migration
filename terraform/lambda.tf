@@ -205,8 +205,9 @@ resource "aws_lambda_function" "orchestrator" {
   role             = aws_iam_role.lambda_role.arn
   handler          = "handler.lambda_handler"
   runtime          = "python3.12"
-  timeout          = 60
+  timeout          = 420   # 7 min: handles 31 days x 10s stagger (310s) + overhead
   memory_size      = 256
+  architectures    = ["arm64"]
 
   filename         = data.archive_file.orchestrator_zip.output_path
   source_code_hash = data.archive_file.orchestrator_zip.output_base64sha256
@@ -237,6 +238,7 @@ resource "aws_lambda_function" "verify_backup" {
   runtime          = "python3.12"
   timeout          = 120
   memory_size      = 256
+  architectures    = ["arm64"]
 
   filename         = data.archive_file.verify_zip.output_path
   source_code_hash = data.archive_file.verify_zip.output_base64sha256
@@ -252,7 +254,7 @@ resource "aws_lambda_function" "verify_backup" {
       DB_PORT       = tostring(var.rds_port)
       DB_NAME       = var.rds_database
       DB_USER       = var.rds_username
-      DB_PASSWORD   = "PLACEHOLDER"  # TODO: read from Secrets Manager in code
+      DB_SECRET_ARN = var.db_secret_arn
       SNS_TOPIC_ARN = aws_sns_topic.migration_alerts.arn
     }
   }
@@ -274,6 +276,7 @@ resource "aws_lambda_function" "drop_partition" {
   runtime          = "python3.12"
   timeout          = 300
   memory_size      = 256
+  architectures    = ["arm64"]
 
   filename         = data.archive_file.drop_zip.output_path
   source_code_hash = data.archive_file.drop_zip.output_base64sha256
@@ -289,7 +292,7 @@ resource "aws_lambda_function" "drop_partition" {
       DB_PORT       = tostring(var.rds_port)
       DB_NAME       = var.rds_database
       DB_USER       = var.rds_username
-      DB_PASSWORD   = "PLACEHOLDER"  # TODO: read from Secrets Manager in code
+      DB_SECRET_ARN = var.db_secret_arn
       S3_BUCKET     = var.s3_bucket_name
       SNS_TOPIC_ARN = aws_sns_topic.migration_alerts.arn
     }
